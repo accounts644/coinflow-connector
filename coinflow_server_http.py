@@ -141,10 +141,20 @@ async def health(request):
     return JSONResponse({"status": "ok", "service": "coinflow-connector"})
 
 
+async def myip(request):
+    try:
+        r = requests.get("https://api.ipify.org?format=json", timeout=5)
+        ip = r.json().get("ip", "unknown")
+    except Exception as e:
+        ip = f"error: {str(e)}"
+    return JSONResponse({"outbound_ip": ip})
+
+
 app = Starlette(
     routes=[
         Route("/", endpoint=health),
         Route("/health", endpoint=health),
+        Route("/myip", endpoint=myip),
         Route("/sse", endpoint=handle_sse),
         Mount("/messages/", app=sse_transport.handle_post_message),
     ]
