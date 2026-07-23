@@ -25,12 +25,12 @@ from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse
 import uvicorn
 
-# ── Coinflow config ───────────────────────────────────────────────
+# ── Coinflow config ───────────────────────────────────────────────────────────
 API_KEY        = os.environ.get("COINFLOW_API_KEY", "")
 VIEW_API_KEY   = os.environ.get("COINFLOW_VIEW_API_KEY", "")
 CF_BASE_URL    = "https://api.coinflow.cash/api"
 
-# ── Breeze config ─────────────────────────────────────────────────
+# ── Breeze config ─────────────────────────────────────────────────────────────
 BREEZE_API_KEY = os.environ.get("BREEZE_API_KEY", "")
 BRZ_BASE_URL   = "https://api.breeze.cash/v1"
 
@@ -46,7 +46,7 @@ if not BREEZE_API_KEY:
 server = Server("coinflow-connector")
 
 
-# ── API helpers ────────────────────────────────────────────────────────────────
+# ── API helpers ─────────────────────────────────────────────────────────────
 
 def cf_get(path: str, params: dict = None) -> dict:
     """Coinflow chargeback API key — dispute/chargeback endpoints."""
@@ -77,13 +77,13 @@ def brz_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 
-# ── Tool definitions ───────────────────────────────────────────────────────────────
+# ── Tool definitions ─────────────────────────────────────────────────────────
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
 
-        # ── Chargeback API tools ────────────────────────────────────────────────────────────
+        # ── Chargeback API tools (existing) ──────────────────────────────────
 
         Tool(
             name="coinflow_get_payment",
@@ -138,7 +138,7 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # ── View API tools ────────────────────────────────────────────────────────────────────
+        # ── View API tools (new) ──────────────────────────────────────────────
 
         Tool(
             name="coinflow_get_all_payments",
@@ -249,31 +249,20 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # ── Breeze API tools ──────────────────────────────────────────────────────────────────────────
+        # ── Breeze API tools ──────────────────────────────────────────────────
 
         Tool(
             name="breeze_list_disputes",
             description=(
-                "List Breeze disputes for Sweet Sweeps. Optionally filter by status. "
-                "Use status='evidence_required' to find disputes that need a response (equivalent to Coinflow responded=false). "
-                "Note: Breeze has a 10-day evidence deadline — much tighter than Coinflow's 30 days."
+                "List all Breeze disputes for Sweet Sweeps. "
+                "The Breeze API returns all disputes in a flat list — each entry includes: "
+                "id, createdAt (Unix ms), email, paymentPageId, livemode. "
+                "Use breeze_get_payment to fetch full details (amount, package, reason) for each dispute. "
+                "Note: Breeze has a 10-day evidence deadline. Evidence is submitted manually via the Breeze dashboard."
             ),
             inputSchema={
                 "type": "object",
                 "properties": {
-                    "status": {
-                        "type": "string",
-                        "description": (
-                            "Filter by dispute status. Key values: "
-                            "evidence_required (needs response), "
-                            "evidence_submitted, evidence_under_review, "
-                            "won, lost, accepted, expired, canceled"
-                        )
-                    },
-                    "email": {
-                        "type": "string",
-                        "description": "Filter disputes by customer email address"
-                    },
                     "limit": {
                         "type": "integer",
                         "description": "Max number of disputes to return (default 50)",
@@ -315,166 +304,4 @@ async def list_tools() -> list[Tool]:
                     },
                     "email": {
                         "type": "string",
-                        "description": "Customer email address to search by (use this OR customer_id)"
-                    }
-                }
-            }
-        ),
-    ]
-
-
-# ── Tool handlers ──────────────────────────────────────────────────────────────────────
-
-@server.call_tool()
-async def call_tool(name: str, arguments: dict) -> list[TextContent]:
-    try:
-
-        # ── Chargeback API ────────────────────────────────────────────────────────────────────────────
-
-        if name == "coinflow_get_payment":
-            data = cf_get(f"/merchant/payments/{arguments['payment_id']}")
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_chargeback":
-            data = cf_get(f"/merchant/chargebacks/{arguments['payment_id']}")
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_all_chargebacks":
-            params = {}
-            if "status" in arguments:
-                params["status"] = arguments["status"]
-            if "limit" in arguments:
-                params["limit"] = arguments["limit"]
-            data = cf_get("/merchant/chargebacks", params=params)
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_customer_history":
-            data = cf_get(f"/customers/{arguments['customer_id']}/history")
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        # ── View API ────────────────────────────────────────────────────────────────────────────────────
-
-        elif name == "coinflow_get_all_payments":
-            params = {}
-            for key in ("status", "startDate", "endDate", "limit"):
-                if key in arguments:
-                    params[key] = arguments[key]
-            data = cf_view_get("/merchant/payments", params=params)
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_wallet_balance":
-            data = cf_view_get("/merchant/balance")
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_merchant_info":
-            data = cf_view_get("/merchant")
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_customer":
-            data = cf_view_get(f"/customers/{arguments['customer_id']}")
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_all_withdrawals":
-            params = {}
-            if "limit" in arguments:
-                params["limit"] = arguments["limit"]
-            data = cf_view_get("/merchant/withdraws", params=params)
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_refunds":
-            params = {}
-            if "limit" in arguments:
-                params["limit"] = arguments["limit"]
-            data = cf_view_get("/merchant/refunds", params=params)
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "coinflow_get_chargeback_stats":
-            params = {}
-            for key in ("startDate", "endDate"):
-                if key in arguments:
-                    params[key] = arguments[key]
-            data = cf_view_get("/merchant/chargebacks/stats", params=params)
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        # ── Breeze API ────────────────────────────────────────────────────────────────────────────────────
-
-        elif name == "breeze_list_disputes":
-            params = {}
-            if "status" in arguments:
-                params["status"] = arguments["status"]
-            if "email" in arguments:
-                params["email"] = arguments["email"]
-            if "limit" in arguments:
-                params["limit"] = arguments["limit"]
-            data = brz_get("/disputes", params=params)
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "breeze_get_payment":
-            data = brz_get(f"/payment-pages/{arguments['payment_id']}")
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        elif name == "breeze_get_customer":
-            if "customer_id" in arguments:
-                data = brz_get(f"/customers/{arguments['customer_id']}")
-            elif "email" in arguments:
-                data = brz_get("/customers", params={"email": arguments["email"]})
-            else:
-                return [TextContent(type="text", text="Error: provide either customer_id or email")]
-            return [TextContent(type="text", text=json.dumps(data, indent=2))]
-
-        else:
-            return [TextContent(type="text", text=f"Unknown tool: {name}")]
-
-    except requests.HTTPError as e:
-        return [TextContent(type="text", text=f"API error {e.response.status_code}: {e.response.text}")]
-    except Exception as e:
-        return [TextContent(type="text", text=f"Error: {str(e)}")]
-
-
-# ── SSE transport setup ─────────────────────────────────────────────────────────────────────────────
-
-sse_transport = SseServerTransport("/messages/")
-
-
-async def handle_sse(request):
-    async with sse_transport.connect_sse(
-        request.scope, request.receive, request._send
-    ) as streams:
-        await server.run(
-            streams[0], streams[1],
-            server.create_initialization_options()
-        )
-
-
-async def health(request):
-    return JSONResponse({
-        "status": "ok",
-        "service": "sweetsweeps-psp-connector",
-        "coinflow_chargeback_api": bool(API_KEY),
-        "coinflow_view_api": bool(VIEW_API_KEY),
-        "breeze_api": bool(BREEZE_API_KEY),
-    })
-
-
-async def myip(request):
-    try:
-        r = requests.get("https://api.ipify.org?format=json", timeout=5)
-        ip = r.json().get("ip", "unknown")
-    except Exception as e:
-        ip = f"error: {str(e)}"
-    return JSONResponse({"outbound_ip": ip})
-
-
-app = Starlette(
-    routes=[
-        Route("/", endpoint=health),
-        Route("/health", endpoint=health),
-        Route("/myip", endpoint=myip),
-        Route("/sse", endpoint=handle_sse),
-        Mount("/messages/", app=sse_transport.handle_post_message),
-    ]
-)
-
-if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+                        "description": "Customer email address to search by (use this OR cH7W7F��W%��B� �ТТТ���Р��2)H)HF�����F�W'2)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ��6W'fW"�6���F����7��2FVb6���F����S�7G"�&wV�V�G3�F�7B���Ɨ7E�FW�D6��FV�EӠ�G'����2)H)H6�&vV&6��)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ���b��R��&6���f��u�vWE���V�B#��FF�6e�vWB�b"��W&6��B���V�G2��&wV�V�G5�w��V�E��Bu��"��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE�6�&vV&6�#��FF�6e�vWB�b"��W&6��B�6�&vV&6�2��&wV�V�G5�w��V�E��Bu��"��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE����6�&vV&6�2#��&�2��Т�b'7FGW2"��&wV�V�G3��&�5�'7FGW2%��&wV�V�G5�'7FGW2%Т�b&Ɩ֗B"��&wV�V�G3��&�5�&Ɩ֗B%��&wV�V�G5�&Ɩ֗B%ТFF�6e�vWB�"��W&6��B�6�&vV&6�2"�&�3�&�2��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE�7W7F��W%���7F�'�#��FF�6e�vWB�b"�7W7F��W'2��&wV�V�G5�v7W7F��W%��Bu�����7F�'�"��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�2)H)Hf�Wr�)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ��VƖb��R��&6���f��u�vWE������V�G2#��&�2��Тf�"�W����'7FGW2"�'7F'DFFR"�&V�DFFR"�&Ɩ֗B"����b�W���&wV�V�G3��&�5��W���&wV�V�G5��W�ТFF�6e�f�Wu�vWB�"��W&6��B���V�G2"�&�3�&�2��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE�v��WE�&��6R#��FF�6e�f�Wu�vWB�"��W&6��B�&��6R"��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE��W&6��E���f�#��FF�6e�f�Wu�vWB�"��W&6��B"��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE�7W7F��W"#��FF�6e�f�Wu�vWB�b"�7W7F��W'2��&wV�V�G5�v7W7F��W%��Bu��"��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE����v�F�G&v�2#��&�2��Т�b&Ɩ֗B"��&wV�V�G3��&�5�&Ɩ֗B%��&wV�V�G5�&Ɩ֗B%ТFF�6e�f�Wu�vWB�"��W&6��B�v�F�G&w2"�&�3�&�2��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE�&VgV�G2#��&�2��Т�b&Ɩ֗B"��&wV�V�G3��&�5�&Ɩ֗B%��&wV�V�G5�&Ɩ֗B%ТFF�6e�f�Wu�vWB�"��W&6��B�&VgV�G2"�&�3�&�2��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&6���f��u�vWE�6�&vV&6��7FG2#��&�2��Тf�"�W����'7F'DFFR"�&V�DFFR"����b�W���&wV�V�G3��&�5��W���&wV�V�G5��W�ТFF�6e�f�Wu�vWB�"��W&6��B�6�&vV&6�2�7FG2"�&�3�&�2��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�2)H)H'&VW�R�)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ��VƖb��R��&'&VW�U�Ɨ7E�F�7WFW2#��2'&VW�R�F�7WFW2V�G���B&WGW&�2��F�7WFW2(	B��6W'fW"�6�FR7FGW2f��FW"7W�'FV@�&�2��Т�b&Ɩ֗B"��&wV�V�G3��&�5�&Ɩ֗B%��&wV�V�G5�&Ɩ֗B%ТFF�''��vWB�"�F�7WFW2"�&�3�&�2��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&'&VW�U�vWE���V�B#��FF�''��vWB�b"���V�B�vW2��&wV�V�G5�w��V�E��Bu��"��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�VƖb��R��&'&VW�U�vWE�7W7F��W"#���b&7W7F��W%��B"��&wV�V�G3��FF�''��vWB�b"�7W7F��W'2��&wV�V�G5�v7W7F��W%��Bu��"��VƖb&V���"��&wV�V�G3��FF�''��vWB�"�7W7F��W'2"�&�3ײ&V���#�&wV�V�G5�&V���%�Ґ�V�6S��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C�$W'&�#�&�f�FRV�F�W"7W7F��W%��B�"V���"�Т&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C֧6���GV�2�FF���FV�C�"��Р�V�6S��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C�b%V���v�F��â���W�"�Р�W�6WB&WVW7G2�EEW'&�"2S��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C�b$�W'&�"�R�&W7��6R�7FGW5�6�FWӢ�R�&W7��6R�FW�G�"�ТW�6WBW�6WF���2S��&WGW&��FW�D6��FV�B�G�S�'FW�B"�FW�C�b$W'&�#��7G"�R��"�Р��2)H)H54RG&�7�'B6WGW)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H)H ��76U�G&�7�'B�76U6W'fW%G&�7�'B�"��W76vW2�"����7��2FVb��F�U�76R�&WVW7B���7��2v�F�76U�G&�7�'B�6���V7E�76R��&WVW7B�66�R�&WVW7B�&V6V�fR�&WVW7B��6V�@��27G&V�3��v�B6W'fW"�'V•7G&V�5���7G&V�5����6W'fW"�7&VFU���F�Ɨ�F�����F���2�������7��2FVb�V�F��&WVW7B���&WGW&��4��&W7��6R���'7FGW2#�&��"��'6W'f�6R#�'7vVWG7vVW2�7�6���V7F�""��&6���f��u�6�&vV&6���#�&�����U����&6���f��u�f�Wu��#�&��d�Uu����U����&'&VW�U��#�&��%$TU�U����U����Ґ���7��2FVbז��&WVW7B���G'���"�&WVW7G2�vWB�&�GG3������g���&s�f�&�C֧6��"�F��V�WC�R����"�6�ₒ�vWB�&�"�'V���v�"��W�6WBW�6WF���2S����b&W'&�#��7G"�R�� �&WGW&��4��&W7��6R��&�WF&�V�E��#��Ґ����7F&�WGFR��&�WFW3հ�&�WFR�"�"�V�G���CֆV�F����&�WFR�"��V�F�"�V�G���CֆV�F����&�WFR�"�ז�"�V�G���C�ז����&�WFR�"�76R"�V�G���Cֆ�F�U�76R�����V�B�"��W76vW2�"��76U�G&�7�'B��F�U��7E��W76vR���Т����b����U����%�������#���'B���B��2�V�f�&���vWB�%�%B"�����Wf�6�&��'V����7C�#���"��'C��'B�
