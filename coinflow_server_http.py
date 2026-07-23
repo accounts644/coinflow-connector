@@ -1,16 +1,20 @@
 #!/usr/bin/env python3
 """
-Coinflow MCP Server for Sweet Sweeps — Railway HTTP/SSE edition
+Sweet Sweeps PSP MCP Server — Railway HTTP/SSE edition
 Runs as a hosted server so all Cowork users connect to one central instance.
 
-Two API keys:
-  COINFLOW_API_KEY      — Chargeback/dispute access (existing)
+Coinflow API keys:
+  COINFLOW_API_KEY      — Chargeback/dispute access
   COINFLOW_VIEW_API_KEY — Read-only view access: payments, customers, balance, reports
+
+Breeze API key:
+  BREEZE_API_KEY        — Full access to Breeze disputes, payments, and customers
 """
 
 import os
 import json
 import asyncio
+import base64
 import requests
 
 from mcp.server import Server
@@ -21,46 +25,65 @@ from starlette.routing import Route, Mount
 from starlette.responses import JSONResponse
 import uvicorn
 
-API_KEY      = os.environ.get("COINFLOW_API_KEY", "")
-VIEW_API_KEY = os.environ.get("COINFLOW_VIEW_API_KEY", "")
-BASE_URL     = "https://api.coinflow.cash/api"
+# ── Coinflow config ───────────────────────────────────────────────
+API_KEY        = os.environ.get("COINFLOW_API_KEY", "")
+VIEW_API_KEY   = os.environ.get("COINFLOW_VIEW_API_KEY", "")
+CF_BASE_URL    = "https://api.coinflow.cash/api"
+
+# ── Breeze config ─────────────────────────────────────────────────
+BREEZE_API_KEY = os.environ.get("BREEZE_API_KEY", "")
+BRZ_BASE_URL   = "https://api.breeze.cash/v1"
 
 if not API_KEY:
     raise RuntimeError("COINFLOW_API_KEY environment variable is not set.")
 
 if not VIEW_API_KEY:
-    print("WARNING: COINFLOW_VIEW_API_KEY not set — view tools will be unavailable.")
+    print("WARNING: COINFLOW_VIEW_API_KEY not set — Coinflow view tools will be unavailable.")
+
+if not BREEZE_API_KEY:
+    print("WARNING: BREEZE_API_KEY not set — Breeze tools will be unavailable.")
 
 server = Server("coinflow-connector")
 
 
-# ── API helpers ──────────────────────────────────────────────────────────────
+# ── API helpers ────────────────────────────────────────────────────────────────
 
 def cf_get(path: str, params: dict = None) -> dict:
-    """Chargeback API key — dispute/chargeback endpoints."""
+    """Coinflow chargeback API key — dispute/chargeback endpoints."""
     headers = {"Authorization": API_KEY, "Content-Type": "application/json"}
-    r = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=15)
+    r = requests.get(f"{CF_BASE_URL}{path}", headers=headers, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
 
 def cf_view_get(path: str, params: dict = None) -> dict:
-    """View API key — read-only merchant/payment/customer endpoints."""
+    """Coinflow view API key — read-only merchant/payment/customer endpoints."""
     if not VIEW_API_KEY:
         raise RuntimeError("COINFLOW_VIEW_API_KEY is not configured on this server.")
     headers = {"Authorization": VIEW_API_KEY, "Content-Type": "application/json"}
-    r = requests.get(f"{BASE_URL}{path}", headers=headers, params=params, timeout=15)
+    r = requests.get(f"{CF_BASE_URL}{path}", headers=headers, params=params, timeout=15)
     r.raise_for_status()
     return r.json()
 
 
-# ── Tool definitions ─────────────────────────────────────────────────────────
+def brz_get(path: str, params: dict = None) -> dict:
+    """Breeze API — Basic auth (api_key as username, empty password)."""
+    if not BREEZE_API_KEY:
+        raise RuntimeError("BREEZE_API_KEY is not configured on this server.")
+    token = base64.b64encode(f"{BREEZE_API_KEY}:".encode()).decode()
+    headers = {"Authorization": f"Basic {token}", "Content-Type": "application/json"}
+    r = requests.get(f"{BRZ_BASE_URL}{path}", headers=headers, params=params, timeout=15)
+    r.raise_for_status()
+    return r.json()
+
+
+# ── Tool definitions ───────────────────────────────────────────────────────────────
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
     return [
 
-        # ── Chargeback API tools (existing) ──────────────────────────────────
+        # ── Chargeback API tools ────────────────────────────────────────────────────────────
 
         Tool(
             name="coinflow_get_payment",
@@ -115,7 +138,7 @@ async def list_tools() -> list[Tool]:
             }
         ),
 
-        # ── View API tools (new) ──────────────────────────────────────────────
+        # ── View API tools ────────────────────────────────────────────────────────────────────
 
         Tool(
             name="coinflow_get_all_payments",
@@ -225,16 +248,88 @@ async def list_tools() -> list[Tool]:
                 }
             }
         ),
+
+        # ── Breeze API tools ──────────────────────────────────────────────────────────────────────────
+
+        Tool(
+            name="breeze_list_disputes",
+            description=(
+                "List Breeze disputes for Sweet Sweeps. Optionally filter by status. "
+                "Use status='evidence_required' to find disputes that need a response (equivalent to Coinflow responded=false). "
+                "Note: Breeze has a 10-day evidence deadline — much tighter than Coinflow's 30 days."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "description": (
+                            "Filter by dispute status. Key values: "
+                            "evidence_required (needs response), "
+                            "evidence_submitted, evidence_under_review, "
+                            "won, lost, accepted, expired, canceled"
+                        )
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Filter disputes by customer email address"
+                    },
+                    "limit": {
+                        "type": "integer",
+                        "description": "Max number of disputes to return (default 50)",
+                        "default": 50
+                    }
+                }
+            }
+        ),
+        Tool(
+            name="breeze_get_payment",
+            description=(
+                "Get details of a Breeze payment page by its ID. "
+                "Returns the purchase amount, currency, description (package contents), "
+                "customer reference, and payment status."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "payment_id": {
+                        "type": "string",
+                        "description": "The Breeze payment page ID"
+                    }
+                },
+                "required": ["payment_id"]
+            }
+        ),
+        Tool(
+            name="breeze_get_customer",
+            description=(
+                "Get Breeze customer details by customer ID or email. "
+                "Returns customer profile, reference ID, and account metadata."
+            ),
+            inputSchema={
+                "type": "object",
+                "properties": {
+                    "customer_id": {
+                        "type": "string",
+                        "description": "The Breeze customer ID (use this OR email)"
+                    },
+                    "email": {
+                        "type": "string",
+                        "description": "Customer email address to search by (use this OR customer_id)"
+                    }
+                }
+            }
+        ),
     ]
 
 
-# ── Tool handlers ─────────────────────────────────────────────────────────────
+# ── Tool handlers ──────────────────────────────────────────────────────────────────────
 
 @server.call_tool()
 async def call_tool(name: str, arguments: dict) -> list[TextContent]:
     try:
 
-        # ── Chargeback API ────────────────────────────────────────────────────
+        # ── Chargeback API ────────────────────────────────────────────────────────────────────────────
 
         if name == "coinflow_get_payment":
             data = cf_get(f"/merchant/payments/{arguments['payment_id']}")
@@ -257,7 +352,7 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             data = cf_get(f"/customers/{arguments['customer_id']}/history")
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
-        # ── View API ──────────────────────────────────────────────────────────
+        # ── View API ────────────────────────────────────────────────────────────────────────────────────
 
         elif name == "coinflow_get_all_payments":
             params = {}
@@ -301,16 +396,42 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             data = cf_view_get("/merchant/chargebacks/stats", params=params)
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
+        # ── Breeze API ────────────────────────────────────────────────────────────────────────────────────
+
+        elif name == "breeze_list_disputes":
+            params = {}
+            if "status" in arguments:
+                params["status"] = arguments["status"]
+            if "email" in arguments:
+                params["email"] = arguments["email"]
+            if "limit" in arguments:
+                params["limit"] = arguments["limit"]
+            data = brz_get("/disputes", params=params)
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "breeze_get_payment":
+            data = brz_get(f"/payment-pages/{arguments['payment_id']}")
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "breeze_get_customer":
+            if "customer_id" in arguments:
+                data = brz_get(f"/customers/{arguments['customer_id']}")
+            elif "email" in arguments:
+                data = brz_get("/customers", params={"email": arguments["email"]})
+            else:
+                return [TextContent(type="text", text="Error: provide either customer_id or email")]
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
     except requests.HTTPError as e:
-        return [TextContent(type="text", text=f"Coinflow API error {e.response.status_code}: {e.response.text}")]
+        return [TextContent(type="text", text=f"API error {e.response.status_code}: {e.response.text}")]
     except Exception as e:
         return [TextContent(type="text", text=f"Error: {str(e)}")]
 
 
-# ── SSE transport setup ───────────────────────────────────────────────────────
+# ── SSE transport setup ─────────────────────────────────────────────────────────────────────────────
 
 sse_transport = SseServerTransport("/messages/")
 
@@ -328,9 +449,10 @@ async def handle_sse(request):
 async def health(request):
     return JSONResponse({
         "status": "ok",
-        "service": "coinflow-connector",
-        "chargeback_api": bool(API_KEY),
-        "view_api": bool(VIEW_API_KEY),
+        "service": "sweetsweeps-psp-connector",
+        "coinflow_chargeback_api": bool(API_KEY),
+        "coinflow_view_api": bool(VIEW_API_KEY),
+        "breeze_api": bool(BREEZE_API_KEY),
     })
 
 
