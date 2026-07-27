@@ -444,7 +444,7 @@ async def health(request):
 
 async def myip(request):
     try:
-        r = requests.get("https://api.ipify.org-format=json", timeout=5)
+        r = requests.get("https://api.ipify.org?format=json", timeout=5)
         ip = r.json().get("ip", "unknown")
     except Exception as e:
         ip = f"error: {str(e)}"
