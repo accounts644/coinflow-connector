@@ -66,6 +66,53 @@ def cf_view_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 
+# -- Security: secret redaction ----------------------------------------------
+
+# Field names whose values are credentials/secrets and must never leave this
+# server. Matched case-insensitively against dict keys at any nesting depth.
+SENSITIVE_KEY_PARTS = (
+    "apikey", "apikeys", "privateuuid", "publicuuid",
+    "secretkey", "secret", "webhookvalidationkey", "validationkey",
+    "feepayer", "usdcpayer", "password", "token",
+    "privatekey", "signingkey", "clientsecret",
+)
+
+# Keys that hold an entire credential bundle - drop the whole subtree.
+SENSITIVE_SUBTREES = ("checkbooksettings", "wallets", "shift4merchantargs")
+
+
+def _is_sensitive(key: str) -> bool:
+    k = key.lower().replace("_", "")
+    return any(part in k for part in SENSITIVE_KEY_PARTS)
+
+
+def redact_secrets(obj):
+    """Recursively strip credentials from an API response before returning it.
+
+    Coinflow's GET /merchant returns the full merchant config, which embeds
+    live processor secrets, hashed API key material and webhook signing keys.
+    None of that is needed for dispute work, so it is removed here rather than
+    being surfaced to the MCP client.
+    """
+    if isinstance(obj, dict):
+        out = {}
+        for key, value in obj.items():
+            kl = key.lower().replace("_", "")
+            if kl in SENSITIVE_SUBTREES:
+                out[key] = "[REDACTED]"
+            elif _is_sensitive(key):
+                if isinstance(value, list):
+                    out[key] = f"[REDACTED: {len(value)} entries]"
+                else:
+                    out[key] = "[REDACTED]"
+            else:
+                out[key] = redact_secrets(value)
+        return out
+    if isinstance(obj, list):
+        return [redact_secrets(item) for item in obj]
+    return obj
+
+
 def brz_get(path: str, params: dict = None) -> dict:
     """Breeze API - Basic auth (api_key as username, empty password)."""
     if not BREEZE_API_KEY:
@@ -180,7 +227,12 @@ async def list_tools() -> list[Tool]:
         ),
         Tool(
             name="coinflow_get_merchant_info",
-            description="Get merchant account details for Sweet Sweeps including configuration, settings, and account status.",
+            description=(
+                "Get merchant account details for Sweet Sweeps including configuration, "
+                "settings, and account status. Credentials (API keys, processor secrets, "
+                "webhook signing keys, wallet key material) are redacted server-side and "
+                "returned as [REDACTED]."
+            ),
             inputSchema={
                 "type": "object",
                 "properties": {}
@@ -231,8 +283,11 @@ async def list_tools() -> list[Tool]:
         Tool(
             name="coinflow_get_chargeback_stats",
             description=(
-                "Get chargeback statistics for a given time period. "
-                "Returns counts and rates by reason code, card network, and outcome."
+                "Get aggregated chargeback statistics for a given time period. "
+                "Returns total count, needs-response count, responded count, total "
+                "disputed amount, and breakdowns by status, reason code and card "
+                "network. Aggregated by this connector from the chargebacks list - "
+                "Coinflow has no server-side stats endpoint."
             ),
             inputSchema={
                 "type": "object",
@@ -356,7 +411,10 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
         elif name == "coinflow_get_merchant_info":
-            data = cf_view_get("/merchant")
+            # GET /merchant returns the full merchant config including live
+            # processor secrets and hashed API key material. Redact before
+            # handing anything back to the client.
+            data = redact_secrets(cf_view_get("/merchant"))
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
         elif name == "coinflow_get_customer":
@@ -378,11 +436,66 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
         elif name == "coinflow_get_chargeback_stats":
-            params = {}
-            for key in ("startDate", "endDate"):
-                if key in arguments:
-                    params[key] = arguments[key]
-            data = cf_view_get("/merchant/chargebacks/stats", params=params)
+            # NOTE: Coinflow has no /merchant/chargebacks/stats endpoint - that
+            # path is parsed as /merchant/chargebacks/{paymentId="stats"} and
+            # returns 404 "Payment not found". Stats are aggregated here from
+            # the chargebacks list instead.
+            start_date = arguments.get("startDate")
+            end_date = arguments.get("endDate")
+
+            raw = cf_get("/merchant/chargebacks", params={"limit": 1000})
+            if isinstance(raw, dict):
+                chargebacks = raw.get("data") or raw.get("chargebacks") or []
+            else:
+                chargebacks = raw or []
+
+            def _in_range(cb):
+                ts = cb.get("createdAt") or cb.get("created_at") or ""
+                if start_date and str(ts) < start_date:
+                    return False
+                if end_date and str(ts) > end_date:
+                    return False
+                return True
+
+            scoped = [cb for cb in chargebacks if _in_range(cb)]
+
+            by_status, by_reason, by_network = {}, {}, {}
+            responded = 0
+            total_cents = 0
+
+            for cb in scoped:
+                status = cb.get("status") or "UNKNOWN"
+                by_status[status] = by_status.get(status, 0) + 1
+
+                reason = cb.get("reasonCode") or cb.get("reason") or "UNKNOWN"
+                by_reason[reason] = by_reason.get(reason, 0) + 1
+
+                network = cb.get("cardType") or cb.get("network") or "UNKNOWN"
+                by_network[network] = by_network.get(network, 0) + 1
+
+                if cb.get("responded"):
+                    responded += 1
+
+                amount = cb.get("amount") or {}
+                if isinstance(amount, dict):
+                    total_cents += amount.get("cents") or 0
+
+            needs_response = sum(
+                1 for cb in scoped
+                if cb.get("status") == "CHARGEBACK" and not cb.get("responded")
+            )
+
+            data = {
+                "computed_by": "connector (no upstream stats endpoint)",
+                "dateRange": {"startDate": start_date, "endDate": end_date},
+                "totalChargebacks": len(scoped),
+                "needsResponse": needs_response,
+                "responded": responded,
+                "totalDisputedAmountUsd": round(total_cents / 100, 2),
+                "byStatus": by_status,
+                "byReasonCode": by_reason,
+                "byCardNetwork": by_network,
+            }
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
         # -- Breeze API --------------------------------------------------------
@@ -444,7 +557,7 @@ async def health(request):
 
 async def myip(request):
     try:
-        r = requests.get("https://api.ipify.org?format=json", timeout=5)
+        r = requests.get("https://api.ipify.org-format=json", timeout=5)
         ip = r.json().get("ip", "unknown")
     except Exception as e:
         ip = f"error: {str(e)}"
