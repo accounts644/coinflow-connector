@@ -15,7 +15,11 @@ import os
 import json
 import asyncio
 import base64
+import hmac
+import hashlib
 import requests
+from datetime import datetime, timezone
+from urllib.parse import urlencode, quote
 
 from mcp.server import Server
 from mcp.server.sse import SseServerTransport
@@ -33,6 +37,18 @@ CF_BASE_URL    = "https://api.coinflow.cash/api"
 # -- Breeze config -------------------------------------------------------------
 BREEZE_API_KEY = os.environ.get("BREEZE_API_KEY", "")
 BRZ_BASE_URL   = "https://api.breeze.cash/v1"
+
+# -- CoinPayments config (read-only) -------------------------------------------
+# Instance-specific base URL: a- / b- / c-api.coinpayments.net. Sweet Sweeps is
+# on instance A. Credentials are NOT interchangeable between instances.
+CP_CLIENT_ID     = os.environ.get("COINPAYMENTS_CLIENT_ID", "")
+CP_CLIENT_SECRET = os.environ.get("COINPAYMENTS_CLIENT_SECRET", "")
+CP_BASE_URL      = os.environ.get("COINPAYMENTS_BASE_URL", "https://a-api.coinpayments.net")
+
+# Tools register only when both credentials are present. Leaving these unset
+# keeps the CoinPayments surface dormant, which makes unsetting them a
+# rollback that needs no redeploy.
+CP_ENABLED = bool(CP_CLIENT_ID and CP_CLIENT_SECRET)
 
 if not API_KEY:
     raise RuntimeError("COINFLOW_API_KEY environment variable is not set.")
@@ -124,11 +140,139 @@ def brz_get(path: str, params: dict = None) -> dict:
     return r.json()
 
 
+def cp_signature(method: str, url: str, timestamp: str, body: str = "") -> str:
+    """HMAC-SHA256 signature for a CoinPayments request.
+
+    Canonical message is the concatenation, with no separators, of:
+        BOM (U+FEFF) + METHOD + full URL (including query string)
+        + clientId + UTC timestamp + raw request body
+
+    Signed with the integration's client secret, Base64-encoded.
+    """
+    message = "\ufeff" + method.upper() + url + CP_CLIENT_ID + timestamp + body
+    digest = hmac.new(
+        CP_CLIENT_SECRET.encode("utf-8"),
+        message.encode("utf-8"),
+        hashlib.sha256,
+    ).digest()
+    return base64.b64encode(digest).decode()
+
+
+def cp_get(path: str, params: dict = None) -> dict:
+    """CoinPayments read-only GET.
+
+    The signature covers the exact URL that is sent, so the URL (including the
+    encoded query string) is built once here and handed to requests whole.
+    Passing params separately would let requests re-encode them and silently
+    invalidate the signature.
+    """
+    if not CP_ENABLED:
+        raise RuntimeError(
+            "COINPAYMENTS_CLIENT_ID / COINPAYMENTS_CLIENT_SECRET are not "
+            "configured on this server."
+        )
+
+    clean = {k: v for k, v in (params or {}).items() if v is not None}
+    query = ("?" + urlencode(clean, quote_via=quote)) if clean else ""
+    url = f"{CP_BASE_URL}/api{path}{query}"
+
+    timestamp = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S")
+    headers = {
+        "X-CoinPayments-Client": CP_CLIENT_ID,
+        "X-CoinPayments-Timestamp": timestamp,
+        "X-CoinPayments-Signature": cp_signature("GET", url, timestamp, ""),
+        "Content-Type": "application/json",
+    }
+
+    r = requests.get(url, headers=headers, timeout=20)
+    r.raise_for_status()
+    return r.json()
+
+
+COINPAYMENTS_TOOLS = [
+    Tool(
+        name="coinpayments_list_invoices",
+        description=(
+            "List CoinPayments invoices for Sweet Sweeps. Read-only. "
+            "Use for reconciling crypto payments against the Sweet Sweeps ledger. "
+            "Note: crypto payments are irreversible - CoinPayments has no chargeback "
+            "or dispute concept, so this is a reconciliation tool, not a dispute tool."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "status": {"type": "string", "description": "Filter by invoice status",
+                           "enum": ["draft", "scheduled", "unpaid", "pending", "paid",
+                                    "completed", "cancelled", "timedOut", "deleted"]},
+                "from": {"type": "string", "description": "Start of range, ISO 8601"},
+                "to": {"type": "string", "description": "End of range, ISO 8601"},
+                "q": {"type": "string", "description": "Free-text search"},
+                "payoutWalletId": {"type": "string", "description": "Filter by payout wallet"},
+                "after": {"type": "string", "description": "Pagination cursor"},
+                "limit": {"type": "integer", "description": "Max results", "default": 50}
+            }
+        }
+    ),
+    Tool(
+        name="coinpayments_get_invoice",
+        description="Get a single CoinPayments invoice by its id. Read-only.",
+        inputSchema={"type": "object",
+                     "properties": {"invoice_id": {"type": "string", "description": "CoinPayments invoice id"}},
+                     "required": ["invoice_id"]}
+    ),
+    Tool(
+        name="coinpayments_get_invoice_history",
+        description=(
+            "Get the state-transition history for a CoinPayments invoice. Read-only. "
+            "Useful for establishing exactly when an invoice moved to paid or completed."
+        ),
+        inputSchema={"type": "object",
+                     "properties": {"invoice_id": {"type": "string", "description": "CoinPayments invoice id"}},
+                     "required": ["invoice_id"]}
+    ),
+    Tool(
+        name="coinpayments_get_invoice_payouts",
+        description="Get payout records for a CoinPayments invoice - amounts, fees, destination, state. Read-only.",
+        inputSchema={"type": "object",
+                     "properties": {"invoice_id": {"type": "string", "description": "CoinPayments invoice id"}},
+                     "required": ["invoice_id"]}
+    ),
+    Tool(
+        name="coinpayments_list_wallets",
+        description=(
+            "List CoinPayments API wallets visible to this integration. Read-only. "
+            "IMPORTANT: wallets are scoped to the integration that created them, and "
+            "wallets created in the CoinPayments dashboard UI are not visible via the "
+            "API at all. A read-only integration will therefore see few or no wallets. "
+            "Invoice endpoints are merchant-scoped and are the reliable surface."
+        ),
+        inputSchema={"type": "object", "properties": {}}
+    ),
+    Tool(
+        name="coinpayments_list_wallet_transactions",
+        description=(
+            "List transactions for a CoinPayments wallet. Read-only. Returns amounts, "
+            "fees, status, type, blockchain tx hash and confirmations. Subject to the "
+            "same integration-scoping caveat as coinpayments_list_wallets."
+        ),
+        inputSchema={
+            "type": "object",
+            "properties": {
+                "wallet_id": {"type": "string", "description": "The CoinPayments wallet id"},
+                "skip": {"type": "integer", "description": "Records to skip (paging)", "default": 0},
+                "take": {"type": "integer", "description": "Records to take (paging)", "default": 50}
+            },
+            "required": ["wallet_id"]
+        }
+    ),
+]
+
+
 # -- Tool definitions ---------------------------------------------------------
 
 @server.list_tools()
 async def list_tools() -> list[Tool]:
-    return [
+    tools = [
 
         # -- Chargeback API tools (existing) ----------------------------------
 
@@ -366,6 +510,11 @@ async def list_tools() -> list[Tool]:
         ),
     ]
 
+    if CP_ENABLED:
+        tools.extend(COINPAYMENTS_TOOLS)
+
+    return tools
+
 
 # -- Tool handlers -------------------------------------------------------------
 
@@ -521,6 +670,43 @@ async def call_tool(name: str, arguments: dict) -> list[TextContent]:
                 return [TextContent(type="text", text="Error: provide either customer_id or email")]
             return [TextContent(type="text", text=json.dumps(data, indent=2))]
 
+        # -- CoinPayments API (read-only) --------------------------------------
+
+        elif name == "coinpayments_list_invoices":
+            params = {}
+            for key in ("status", "from", "to", "q", "payoutWalletId", "after", "limit"):
+                if key in arguments:
+                    params[key] = arguments[key]
+            data = cp_get("/v2/merchant/invoices", params=params)
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "coinpayments_get_invoice":
+            data = cp_get(f"/v2/merchant/invoices/{arguments['invoice_id']}")
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "coinpayments_get_invoice_history":
+            data = cp_get(f"/v2/merchant/invoices/{arguments['invoice_id']}/history")
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "coinpayments_get_invoice_payouts":
+            data = cp_get(f"/v2/merchant/invoices/{arguments['invoice_id']}/payouts")
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "coinpayments_list_wallets":
+            data = cp_get("/v2/merchant/wallets")
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
+        elif name == "coinpayments_list_wallet_transactions":
+            params = {}
+            for key in ("skip", "take"):
+                if key in arguments:
+                    params[key] = arguments[key]
+            data = cp_get(
+                f"/v2/merchant/wallets/{arguments['wallet_id']}/transactions",
+                params=params,
+            )
+            return [TextContent(type="text", text=json.dumps(data, indent=2))]
+
         else:
             return [TextContent(type="text", text=f"Unknown tool: {name}")]
 
@@ -552,6 +738,7 @@ async def health(request):
         "coinflow_chargeback_api": bool(API_KEY),
         "coinflow_view_api": bool(VIEW_API_KEY),
         "breeze_api": bool(BREEZE_API_KEY),
+        "coinpayments_api": CP_ENABLED,
     })
 
 
